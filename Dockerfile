@@ -4,7 +4,7 @@
 #
 # If n8n ever complains about the Node version, bump NODE_VERSION.
 # After the first good deploy, pin N8N_VERSION (e.g. 1.xx.x) for stable rebuilds.
-ARG NODE_VERSION=22
+ARG NODE_VERSION=24
 FROM node:${NODE_VERSION}-bookworm-slim
 
 ARG N8N_VERSION=latest
