@@ -15,6 +15,14 @@ Backends (env IMAGE_BACKEND, or --images):
   instantid    real face-locked images from the Hugging Face Space (default)
   placeholder  black test frames, no GPU quota used (marked inside the PNG so they are never mistaken for real images)
 
+Motion (env VIDEO_BACKEND, or --video; default none):
+  none         no motion clips (scenes render as slow-zoom stills)
+  wan          image-to-video through a Hugging Face Wan 2.x Space -> scene_<N>.mp4 (3-5 s moving clip)
+  placeholder  fake slow-zoom clips, no GPU, to test the timing/render logic
+Optional storyboard columns: motion_prompt_en (what should move), animate (no/false/0 = keep this scene a still)
+Env for wan (optional): WAN_SPACE (default zerogpu-aoti/wan2-2-fp8da-aoti-faster), WAN_CLIP_SECONDS (3), WAN_STEPS (4),
+                        REQUIRE_VIDEO=1 (fail with exit 3 instead of rendering stills when a clip cannot be made)
+
 Re-running resumes: finished voices/images are skipped. A placeholder image is NOT treated as finished when the
 backend is instantid: it is replaced automatically.
 
@@ -43,6 +51,9 @@ PAUSE_SECONDS = 0.3
 NEGATIVE_PROMPT = "blurry, low quality, distorted face, extra limbs, watermark, deformed, text, logo"
 QUOTA_HINTS = ("quota", "zerogpu", "exceeded your", "too many requests", "429", "rate limit")
 PLACEHOLDER_KEY = b"AIDRAMA_PLACEHOLDER"
+DEFAULT_WAN_SPACE = "zerogpu-aoti/wan2-2-fp8da-aoti-faster"
+WAN_NEGATIVE_PROMPT = ("blurry, low quality, static, still image, frozen, distorted face, deformed, extra limbs, "
+                       "morphing, flicker, watermark, text, subtitles")
 PLACEHOLDER_MAX_BYTES = 40_000   # a black 1080x1920 PNG is ~6 KB; a real generated image is far larger
 
 
@@ -328,7 +339,7 @@ def extract_result_path(result):
     while isinstance(r, (list, tuple)) and r:
         r = r[0]
     if isinstance(r, dict):
-        r = r.get("path") or r.get("value") or r.get("name")
+        r = r.get("video") or r.get("path") or r.get("value") or r.get("name")
         if isinstance(r, dict):
             r = r.get("path")
     if not isinstance(r, str) or not Path(r).exists():
@@ -385,6 +396,176 @@ class InstantIDClient:
                 time.sleep(delays[attempt])
 
 
+# ------------------------------------------------------- motion (Wan) ------
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return float(default)
+
+
+def wants_video(scene):
+    """Optional storyboard column 'animate': no/false/0/off keeps the scene a still."""
+    return str(scene.get("animate", "")).strip().lower() not in ("no", "n", "false", "0", "off", "skip", "still")
+
+
+def motion_prompt(scene):
+    """What should MOVE (the image already defines what is in the shot)."""
+    custom = str(scene.get("motion_prompt_en", "") or "").strip()
+    if custom:
+        return re.sub(r"\s+", " ", custom)
+    mood = str(scene.get("mood", "") or "").strip().lower()
+    mood_part = f" {mood} mood." if mood else ""
+    return (f"Cinematic drama shot.{mood_part} The characters move naturally: subtle breathing, small head and body "
+            "movements, natural facial expressions, blinking. Slow smooth camera push-in. Realistic motion, stable identity.")
+
+
+def mp4_is_placeholder(path):
+    if not non_empty(path) or path.stat().st_size > 30_000_000:
+        return False
+    return PLACEHOLDER_KEY in path.read_bytes()
+
+
+def video_needed(mp4, backend):
+    if not non_empty(mp4):
+        return True
+    return backend == "wan" and mp4_is_placeholder(mp4)
+
+
+def prepare_wan_input(png, out_path):
+    """Center-crop to 9:16 (same framing render.sh will use) and shrink, so Wan gets a portrait image."""
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(png), "-vf",
+                    "crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)',scale=480:854", "-frames:v", "1", str(out_path)], check=True)
+
+
+def make_placeholder_clip(png, out_path, seconds=3.0):
+    """Fake 'motion' clip (slow zoom, 16 fps) marked as placeholder; for testing the render/timing logic."""
+    frames = max(8, int(seconds * 16))
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-i", str(png), "-t", str(seconds), "-vf",
+                    f"scale=480:854:force_original_aspect_ratio=increase,crop=480:854,"
+                    f"zoompan=z='1+0.1*on/{frames}':d={frames}:s=480x854:fps=16,format=yuv420p",
+                    "-c:v", "libx264", "-preset", "veryfast", "-metadata", f"comment={PLACEHOLDER_KEY.decode()}",
+                    "-movflags", "+faststart", str(out_path)], check=True)
+    if not non_empty(out_path):
+        raise RuntimeError("placeholder clip was not created")
+
+
+IMAGE_PARAM_NAMES = {"input_image", "image", "start_image", "first_image", "image_path", "input_img", "init_image"}
+LAST_IMAGE_HINTS = ("last", "end", "final")
+
+
+def is_image_param(p):
+    """Image input? Uses the Space's own type info when present (component 'Image' / filepath), else the name."""
+    key = p["parameter_name"].lower()
+    component = str(p.get("component", "")).lower()
+    python_type = str((p.get("python_type") or {}).get("type", "")).lower()
+    if component in ("image", "imageeditor") or key in IMAGE_PARAM_NAMES:
+        return True
+    return python_type == "filepath" and ("image" in key or "img" in key)
+
+
+def build_wan_kwargs(params, image_path, prompt, seed, seconds, steps, handle_file):
+    """Map our values onto the Space's CURRENT parameters (case-insensitive); skip optional unknowns; fail on unknown required ones."""
+    known = {
+        "prompt": lambda: prompt,
+        "negative_prompt": lambda: WAN_NEGATIVE_PROMPT,
+        "steps": lambda: steps, "num_inference_steps": lambda: steps, "sampling_steps": lambda: steps,
+        "duration_seconds": lambda: seconds, "duration": lambda: seconds,
+        "guidance_scale": lambda: 1.0, "guidance_scale_2": lambda: 1.0,
+        "seed": lambda: seed, "randomize_seed": lambda: False,
+    }
+    kwargs, missing, image_set = {}, [], False
+    for p in params:
+        pname = p["parameter_name"]
+        key = pname.lower()
+        if is_image_param(p):
+            if any(h in key for h in LAST_IMAGE_HINTS):
+                if not p.get("parameter_has_default"):
+                    kwargs[pname] = None            # optional last-frame image: not used
+            elif not image_set:
+                kwargs[pname] = handle_file(str(image_path))
+                image_set = True
+            elif not p.get("parameter_has_default"):
+                kwargs[pname] = None
+        elif key in known:
+            kwargs[pname] = known[key]()
+        elif not p.get("parameter_has_default"):
+            missing.append(pname)
+    if missing:
+        raise RuntimeError("The Wan Space API changed; unknown required parameters: " + ", ".join(missing))
+    if not image_set:
+        raise RuntimeError("The Wan Space API changed; no input image parameter found")
+    return kwargs
+
+
+class WanClient:
+    def __init__(self):
+        self.client = None
+        self.endpoint = None
+        self.params = None
+        self.handle_file = None
+
+    def connect(self):
+        from gradio_client import Client, handle_file
+        self.handle_file = handle_file
+        space = os.environ.get("WAN_SPACE", DEFAULT_WAN_SPACE)
+        token = (os.environ.get("HF_TOKEN") or "").strip() or None
+        log(f"Connecting to Wan Space {space} ({'with' if token else 'without'} token)")
+        if token:
+            try:
+                self.client = Client(space, token=token)
+            except TypeError:
+                self.client = Client(space, hf_token=token)
+        else:
+            self.client = Client(space)
+        api = self.client.view_api(return_format="dict")
+        endpoints = api.get("named_endpoints", {})
+        name = next((k for k in endpoints if "generate" in k and "video" in k), None) \
+            or next((k for k in endpoints if "generate" in k), None) \
+            or next((k for k in endpoints if "video" in k), None)
+        if not name:
+            raise RuntimeError("The Wan Space has no generate/video endpoint; available: " + ", ".join(endpoints))
+        self.endpoint, self.params = name, endpoints[name]["parameters"]
+        log(f"Using Wan endpoint {name} with parameters: {', '.join(p['parameter_name'] for p in self.params)}")
+
+    def generate(self, image_path, prompt, seed, out_path, seconds, steps):
+        if self.client is None:
+            self.connect()
+        kwargs = build_wan_kwargs(self.params, image_path, prompt, seed, seconds, steps, self.handle_file)
+        delays = [20, 60, 120]
+        for attempt in range(len(delays) + 1):
+            try:
+                result = self.client.predict(api_name=self.endpoint, **kwargs)
+                shutil.copy(extract_result_path(result), out_path)
+                return
+            except Exception as exc:  # noqa: BLE001
+                text = str(exc).lower()
+                if any(h in text for h in QUOTA_HINTS):
+                    raise QuotaError(str(exc)) from exc
+                if attempt == len(delays):
+                    raise
+                log(f"    clip retry {attempt + 1}/{len(delays)} in {delays[attempt]}s after: {str(exc)[:200]}")
+                time.sleep(delays[attempt])
+
+
+def make_scene_video(scene, png, out_mp4, backend, wan, seconds, steps, by_name, work):
+    """Returns 'wan' or 'placeholder'. Raises QuotaError / RuntimeError."""
+    if backend == "placeholder":
+        make_placeholder_clip(png, out_mp4, seconds)
+        return "placeholder"
+    num = scene_num(scene)
+    wan_in = work / f"_wan_in_{num}.png"
+    prepare_wan_input(png, wan_in)
+    try:
+        primary = pick_primary(scene, by_name)
+        seed = int(float(by_name[primary].get("avatar_seed") or 42))
+    except Exception:  # noqa: BLE001
+        seed = 42
+    wan.generate(wan_in, motion_prompt(scene), seed, out_mp4, seconds, steps)
+    wan_in.unlink(missing_ok=True)
+    return "wan"
+
+
 # ------------------------------------------------------------------ main ----
 def main(argv=None):
     ap = argparse.ArgumentParser()
@@ -392,12 +573,21 @@ def main(argv=None):
     ap.add_argument("--scenes", default="", help="optional filter, e.g. '1-3,7' (default: all scenes)")
     ap.add_argument("--images", choices=["instantid", "placeholder"], default=None,
                     help="image backend; default comes from env IMAGE_BACKEND, else instantid")
+    ap.add_argument("--video", choices=["none", "wan", "placeholder"], default=None,
+                    help="motion backend; default comes from env VIDEO_BACKEND, else none")
     args = ap.parse_args(argv)
 
     backend = (args.images or os.environ.get("IMAGE_BACKEND") or "instantid").strip().lower()
     if backend not in ("instantid", "placeholder"):
         raise RuntimeError(f"Unknown IMAGE_BACKEND '{backend}'. Use 'instantid' or 'placeholder'.")
-    log(f"Image backend: {backend}")
+    video_backend = (args.video or os.environ.get("VIDEO_BACKEND") or "none").strip().lower()
+    if video_backend not in ("none", "wan", "placeholder"):
+        raise RuntimeError(f"Unknown VIDEO_BACKEND '{video_backend}'. Use 'none', 'wan' or 'placeholder'.")
+    require_video = os.environ.get("REQUIRE_VIDEO", "0").strip().lower() in ("1", "true", "yes")
+    clip_seconds = env_float("WAN_CLIP_SECONDS", 3.0)
+    wan_steps = int(env_float("WAN_STEPS", 4))
+    log(f"Image backend: {backend} | Video backend: {video_backend}"
+        + (f" ({clip_seconds:g}s clips, {wan_steps} steps)" if video_backend != "none" else ""))
 
     work = Path(args.workdir)
     characters = json.loads((work / "characters.json").read_text(encoding="utf-8"))
@@ -414,7 +604,7 @@ def main(argv=None):
     voice_map = build_voice_map(characters)
     rx = build_speaker_regex(voice_map)
 
-    # Stale placeholders must be replaced when real images are requested.
+    # Stale placeholders must be replaced when real images / real clips are requested.
     avatars = {}
     if backend == "instantid":
         for s in scenes:
@@ -430,7 +620,9 @@ def main(argv=None):
             log(f"Avatar ready: {name}")
 
     instantid = InstantIDClient()
-    failed = []
+    wan = WanClient()
+    failed, video_missing = [], []
+    wan_quota_hit = False
     total = len(scenes)
     for idx, scene in enumerate(scenes, 1):
         num = scene_num(scene)
@@ -442,33 +634,77 @@ def main(argv=None):
             failed.append((num, "voice", str(exc)))
             continue
 
+        # ---- image ----
         out_png = work / f"scene_{num}.png"
-        if not image_needed(out_png, backend):
+        image_ok = True
+        if image_needed(out_png, backend):
+            try:
+                if backend == "placeholder":
+                    make_placeholder_image(out_png)
+                    log("  image: placeholder generated (test mode, no GPU used)")
+                else:
+                    primary = pick_primary(scene, by_name)
+                    seed = int(float(by_name[primary].get("avatar_seed") or 42))
+                    prompt = re.sub(r"\s+", " ", str(scene["visual_prompt_en"])).strip()
+                    log(f"  image: face lock = {primary}, seed = {seed}")
+                    started = time.time()
+                    instantid.generate(avatars[primary], prompt, seed, out_png)
+                    log(f"  image: done in {time.time() - started:.0f}s (wall clock, includes queue time)")
+            except QuotaError as exc:
+                log(f"GPU QUOTA EXHAUSTED at scene {num} (image): {str(exc)[:300]}")
+                log("Re-run after the quota resets (24 h after first GPU use), or upgrade the Hugging Face plan. Finished scenes are kept.")
+                return 3
+            except Exception as exc:  # noqa: BLE001
+                log(f"  IMAGE FAILED: {exc}")
+                failed.append((num, "image", str(exc)))
+                image_ok = False
+        else:
             log("  image: skipped (already exists)")
+
+        # ---- motion clip ----
+        if video_backend == "none" or not image_ok:
+            continue
+        out_mp4 = work / f"scene_{num}.mp4"
+        if not wants_video(scene):
+            log("  video: skipped (animate = no, this scene stays a still)")
+            continue
+        if not video_needed(out_mp4, video_backend):
+            log("  video: skipped (clip already exists)")
+            continue
+        if video_backend == "wan" and is_placeholder(out_png):
+            log("  video: skipped (the image is still a placeholder, not spending GPU on it)")
+            video_missing.append(num)
+            continue
+        if wan_quota_hit:
+            video_missing.append(num)
+            log("  video: skipped (GPU quota already exhausted in this run)")
             continue
         try:
-            if backend == "placeholder":
-                make_placeholder_image(out_png)
-                log("  image: placeholder generated (test mode, no GPU used)")
-                continue
-            primary = pick_primary(scene, by_name)
-            seed = int(float(by_name[primary].get("avatar_seed") or 42))
-            prompt = re.sub(r"\s+", " ", str(scene["visual_prompt_en"])).strip()
-            log(f"  image: face lock = {primary}, seed = {seed}")
             started = time.time()
-            instantid.generate(avatars[primary], prompt, seed, out_png)
-            log(f"  image: done in {time.time() - started:.0f}s (wall clock, includes queue time)")
+            kind = make_scene_video(scene, out_png, out_mp4, video_backend, wan, clip_seconds, wan_steps, by_name, work)
+            log(f"  video: {kind} clip done in {time.time() - started:.0f}s (wall clock, includes queue time)")
         except QuotaError as exc:
-            log(f"GPU QUOTA EXHAUSTED at scene {num}: {str(exc)[:300]}")
-            log("Re-run after the quota resets (24 h after first GPU use), or upgrade the Hugging Face plan. Finished scenes are kept.")
-            return 3
+            wan_quota_hit = True
+            video_missing.append(num)
+            log(f"GPU QUOTA EXHAUSTED at scene {num} (video): {str(exc)[:300]}")
+            if require_video:
+                return 3
+            log("  Continuing without more clips; remaining scenes will render as stills. Re-run later to add them.")
         except Exception as exc:  # noqa: BLE001
-            log(f"  IMAGE FAILED: {exc}")
-            failed.append((num, "image", str(exc)))
+            log(f"  VIDEO FAILED: {exc}")
+            video_missing.append(num)
+            out_mp4.unlink(missing_ok=True)
+            if require_video:
+                failed.append((num, "video", str(exc)))
 
     if failed:
         log("Failed scenes: " + "; ".join(f"{n} ({kind})" for n, kind, _ in failed))
         return 2
+    if video_missing:
+        log(f"PARTIAL: no motion clip for scene(s) {sorted(set(video_missing))}; they will render as slow-zoom stills. "
+            "Re-run later with the same folder to add the clips.")
+        if require_video:
+            return 3
     log(f"All {total} scene(s) generated.")
     return 0
 
