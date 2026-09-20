@@ -90,7 +90,7 @@ jobs:
             --arg file_id "$FILE_ID" \
             --arg run_url "$RUN_URL" \
             '{video_id:$video_id, folder_id:$folder_id, status:$status, file_id:$file_id, run_url:$run_url}')
-          curl -sS --retry 5 --retry-delay 20 --retry-all-errors --max-time 120 \
+          curl -sS --fail-with-body --retry 5 --retry-delay 20 --retry-all-errors --max-time 120 \
             -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" \
             -H "X-Callback-Secret: $CALLBACK_SECRET" \
