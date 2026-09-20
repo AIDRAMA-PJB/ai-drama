@@ -44,6 +44,7 @@ jobs:
       VIDEO_ID: ${{ inputs.video_id }}
       FOLDER_ID: ${{ inputs.folder_id }}
       SCENES: ${{ inputs.scenes }}
+      IMAGE_BACKEND: ${{ inputs.image_backend }}
     steps:
       - name: Validate inputs
         run: |
