@@ -4,8 +4,10 @@ name: render-video
 # storyboard.json + characters.json to a Drive folder; EVERYTHING heavy happens here:
 #   download job files -> voices + face-locked images (worker/generate_assets.py) -> render.sh (FFmpeg)
 #   -> upload final.mp4 -> call n8n's callback webhook.
-# Re-running with the same folder resumes: finished scene files are downloaded and skipped
-# (placeholder images are replaced automatically when image_backend = instantid).
+# Re-running with the same folder resumes: finished scene files (images, voices, motion clips) are downloaded and
+# skipped; placeholder images/clips are replaced automatically by real ones.
+# Motion: video_backend = wan animates each scene image into a short clip (scene_N.mp4); render.sh plays the clip and
+# holds its last frame with a slow zoom until the narration ends. Default is none (still images only, no extra GPU).
 
 on:
   workflow_dispatch:
@@ -28,6 +30,16 @@ on:
         required: false
         default: "instantid"
         type: string
+      video_backend:
+        description: "Motion backend: none (stills), wan (real image-to-video) or placeholder (fake clips, no GPU)"
+        required: false
+        default: "none"
+        type: string
+      wan_seconds:
+        description: "Length of each Wan clip in seconds (1-5, e.g. 3)"
+        required: false
+        default: "3"
+        type: string
 
 concurrency:
   group: render-${{ inputs.video_id }}
@@ -46,6 +58,8 @@ jobs:
       FOLDER_ID: ${{ inputs.folder_id }}
       SCENES: ${{ inputs.scenes }}
       IMAGE_BACKEND: ${{ inputs.image_backend }}
+      VIDEO_BACKEND: ${{ inputs.video_backend }}
+      WAN_CLIP_SECONDS: ${{ inputs.wan_seconds }}
     steps:
       - name: Validate inputs
         run: |
@@ -53,6 +67,8 @@ jobs:
           [[ "$FOLDER_ID" =~ ^[A-Za-z0-9_-]{10,100}$ ]] || { echo "Invalid folder_id"; exit 1; }
           [[ "$SCENES" =~ ^[0-9,\ -]*$ ]] || { echo "Invalid scenes filter"; exit 1; }
           [[ "$IMAGE_BACKEND" =~ ^(instantid|placeholder)$ ]] || { echo "image_backend must be instantid or placeholder"; exit 1; }
+          [[ "$VIDEO_BACKEND" =~ ^(none|wan|placeholder)$ ]] || { echo "video_backend must be none, wan or placeholder"; exit 1; }
+          [[ "$WAN_CLIP_SECONDS" =~ ^[1-5](\.[0-9])?$ ]] || { echo "wan_seconds must be between 1 and 5, e.g. 3 or 3.5"; exit 1; }
 
       - uses: actions/checkout@v4
 
@@ -80,23 +96,25 @@ jobs:
           mkdir -p work
           rclone copy gdrive: work --drive-root-folder-id "$FOLDER_ID" \
             --include "storyboard.json" --include "characters.json" \
-            --include "scene_*.png" --include "scene_*.mp3" --include "bgm.mp3" -v
+            --include "scene_*.png" --include "scene_*.mp3" --include "scene_*.mp4" --include "bgm.mp3" -v
           ls -la work
           [ -s work/storyboard.json ] && [ -s work/characters.json ] || { echo "storyboard.json / characters.json missing in the Drive folder"; exit 1; }
 
-      - name: Generate voices and images
+      - name: Generate voices, images and motion clips
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           # INSTANTID_LCM: "1" (default, fast LCM mode) or "0" (20-step quality mode)
+          # WAN_SPACE: override the Wan Space (default zerogpu-aoti/wan2-2-fp8da-aoti-faster); WAN_STEPS: default 4
+          # REQUIRE_VIDEO: "1" = fail (exit 3) instead of rendering stills when a clip cannot be made
         run: |
-          .venv/bin/python worker/generate_assets.py --workdir work --scenes "$SCENES" --images "$IMAGE_BACKEND"
+          .venv/bin/python worker/generate_assets.py --workdir work --scenes "$SCENES" --images "$IMAGE_BACKEND" --video "$VIDEO_BACKEND"
 
       - name: Save generated scenes to Drive (also when the step above failed)
         if: always()
         run: |
           [ -d work ] || exit 0
           rclone copy work gdrive: --drive-root-folder-id "$FOLDER_ID" \
-            --include "scene_*.png" --include "scene_*.mp3" -v || true
+            --include "scene_*.png" --include "scene_*.mp3" --include "scene_*.mp4" -v || true
 
       - name: Render video
         run: |
