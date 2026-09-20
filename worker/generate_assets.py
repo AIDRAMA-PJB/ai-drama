@@ -337,6 +337,33 @@ class InstantIDClient:
 
 
 # ------------------------------------------------------------------ main ----
+def generate_placeholder_image(scene, out_path):
+    """
+    Generate a simple placeholder image so the complete
+    TTS -> FFmpeg -> Drive -> callback pipeline can be tested
+    without using Hugging Face GPU quota.
+    """
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=1080x1920",
+            "-frames:v",
+            "1",
+            str(out_path),
+        ],
+        check=True,
+    )
+
+    if not non_empty(out_path):
+        raise RuntimeError("placeholder image was not created")
+
+    log("  image: placeholder generated")
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--workdir", required=True)
@@ -384,12 +411,23 @@ def main(argv=None):
             log("  image: skipped (already exists)")
             continue
         try:
-            primary = pick_primary(scene, by_name)
-            seed = int(float(by_name[primary].get("avatar_seed") or 42))
-            prompt = re.sub(r"\s+", " ", str(scene["visual_prompt_en"])).strip()
-            log(f"  image: face lock = {primary}, seed = {seed}")
-            instantid.generate(avatars[primary], prompt, seed, out_png)
-            log("  image: done")
+    if IMAGE_BACKEND == "placeholder":
+        generate_placeholder_image(scene, out_png)
+
+    elif IMAGE_BACKEND == "instantid":
+        primary = pick_primary(scene, by_name)
+        seed = int(float(by_name[primary].get("avatar_seed") or 42))
+        prompt = re.sub(r"\s+", " ", str(scene["visual_prompt_en"])).strip()
+
+        log(f"  image: face lock = {primary}, seed = {seed}")
+        instantid.generate(avatars[primary], prompt, seed, out_png)
+        log("  image: done")
+
+    else:
+        raise RuntimeError(
+            f"Unknown IMAGE_BACKEND: {IMAGE_BACKEND}. "
+            "Use 'instantid' or 'placeholder'."
+        )
         except QuotaError as exc:
             log(f"GPU QUOTA EXHAUSTED at scene {num}: {str(exc)[:300]}")
             log("Add a Hugging Face token as the HF_TOKEN repo secret, or re-run later. Finished scenes are kept.")
