@@ -1,10 +1,11 @@
 name: render-video
 
-# Triggered by n8n (workflow_dispatch). n8n only uploads storyboard.json + characters.json to a
-# Drive folder; EVERYTHING heavy happens here:
+# Triggered by n8n (workflow_dispatch) or manually from the Actions tab. n8n only uploads
+# storyboard.json + characters.json to a Drive folder; EVERYTHING heavy happens here:
 #   download job files -> voices + face-locked images (worker/generate_assets.py) -> render.sh (FFmpeg)
 #   -> upload final.mp4 -> call n8n's callback webhook.
-# Re-running with the same folder resumes: finished scene files are downloaded and skipped.
+# Re-running with the same folder resumes: finished scene files are downloaded and skipped
+# (placeholder images are replaced automatically when image_backend = instantid).
 
 on:
   workflow_dispatch:
@@ -22,12 +23,12 @@ on:
         required: false
         default: ""
         type: string
-        
       image_backend:
-        description: "Image backend: instantid or placeholder"
+        description: "Image backend: instantid (real images) or placeholder (black frames, no GPU quota)"
         required: false
         default: "instantid"
         type: string
+
 concurrency:
   group: render-${{ inputs.video_id }}
   cancel-in-progress: false
@@ -51,6 +52,7 @@ jobs:
           [[ "$VIDEO_ID" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "Invalid video_id"; exit 1; }
           [[ "$FOLDER_ID" =~ ^[A-Za-z0-9_-]{10,100}$ ]] || { echo "Invalid folder_id"; exit 1; }
           [[ "$SCENES" =~ ^[0-9,\ -]*$ ]] || { echo "Invalid scenes filter"; exit 1; }
+          [[ "$IMAGE_BACKEND" =~ ^(instantid|placeholder)$ ]] || { echo "image_backend must be instantid or placeholder"; exit 1; }
 
       - uses: actions/checkout@v4
 
@@ -82,11 +84,12 @@ jobs:
           ls -la work
           [ -s work/storyboard.json ] && [ -s work/characters.json ] || { echo "storyboard.json / characters.json missing in the Drive folder"; exit 1; }
 
-      - name: Generate voices and face-locked images
+      - name: Generate voices and images
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # INSTANTID_LCM: "1" (default, fast LCM mode) or "0" (20-step quality mode)
         run: |
-          .venv/bin/python worker/generate_assets.py --workdir work --scenes "$SCENES"
+          .venv/bin/python worker/generate_assets.py --workdir work --scenes "$SCENES" --images "$IMAGE_BACKEND"
 
       - name: Save generated scenes to Drive (also when the step above failed)
         if: always()
