@@ -230,39 +230,50 @@ def pick_primary(scene, characters_by_name):
 
 
 def build_kwargs(params, face_path, prompt, seed, handle_file):
-    """Only pass parameters the Space currently exposes; fail loudly if it now needs something unknown."""
+    """Build only parameters currently exposed by the InstantID Space."""
     known = {
         "face_image_path": lambda: handle_file(str(face_path)),
         "pose_image_path": lambda: None,
         "prompt": lambda: prompt,
         "negative_prompt": lambda: NEGATIVE_PROMPT,
         "style_name": lambda: "(No style)",
-        "num_steps": lambda: 20,
-        "identitynet_strength_ratio": lambda: 0.85,
-        "adapter_strength_ratio": lambda: 0.75,
-        "pose_strength": lambda: 0.3,
+
+        # LCM mode: intentionally low-step for ZeroGPU testing.
+        "num_steps": lambda: 4,
+        "identitynet_strength_ratio": lambda: 0.8,
+        "adapter_strength_ratio": lambda: 0.8,
         "canny_strength": lambda: 0.3,
-        "controlnet_selection": lambda: [],
-        "guidance_scale": lambda: 5.0,
+        "depth_strength": lambda: 0.4,
+        "controlnet_selection": lambda: ["depth"],
+        "guidance_scale": lambda: 1.0,
         "seed": lambda: seed,
         "scheduler": lambda: "EulerDiscreteScheduler",
-        "enable_LCM": lambda: False,
+        "enable_lcm": lambda: True,
         "enhance_face_region": lambda: True,
     }
+
     kwargs, missing = {}, []
+
     for p in params:
         pname = p["parameter_name"]
+
         if pname in known:
             kwargs[pname] = known[pname]()
         elif not p.get("parameter_has_default"):
             missing.append(pname)
+
     if missing:
-        raise RuntimeError("The Space API changed; unknown required parameters: " + ", ".join(missing))
+        raise RuntimeError(
+            "The Space API changed; unknown required parameters: "
+            + ", ".join(missing)
+        )
+
     if "face_image_path" not in kwargs or "prompt" not in kwargs:
-        raise RuntimeError("The Space API changed; no face_image_path/prompt parameter found")
+        raise RuntimeError(
+            "The Space API changed; no face_image_path/prompt parameter found"
+        )
+
     return kwargs
-
-
 def extract_result_path(result):
     r = result
     while isinstance(r, (list, tuple)) and r:
