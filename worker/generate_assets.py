@@ -410,24 +410,24 @@ def main(argv=None):
         if non_empty(out_png):
             log("  image: skipped (already exists)")
             continue
-        try:
-    if IMAGE_BACKEND == "placeholder":
-        generate_placeholder_image(scene, out_png)
+                try:
+            if IMAGE_BACKEND == "placeholder":
+                generate_placeholder_image(scene, out_png)
 
-    elif IMAGE_BACKEND == "instantid":
-        primary = pick_primary(scene, by_name)
-        seed = int(float(by_name[primary].get("avatar_seed") or 42))
-        prompt = re.sub(r"\s+", " ", str(scene["visual_prompt_en"])).strip()
+            elif IMAGE_BACKEND == "instantid":
+                primary = pick_primary(scene, by_name)
+                seed = int(float(by_name[primary].get("avatar_seed") or 42))
+                prompt = re.sub(r"\s+", " ", str(scene["visual_prompt_en"])).strip()
 
-        log(f"  image: face lock = {primary}, seed = {seed}")
-        instantid.generate(avatars[primary], prompt, seed, out_png)
-        log("  image: done")
+                log(f"  image: face lock = {primary}, seed = {seed}")
+                instantid.generate(avatars[primary], prompt, seed, out_png)
+                log("  image: done")
 
-    else:
-        raise RuntimeError(
-            f"Unknown IMAGE_BACKEND: {IMAGE_BACKEND}. "
-            "Use 'instantid' or 'placeholder'."
-        )
+            else:
+                raise RuntimeError(
+                    f"Unknown IMAGE_BACKEND: {IMAGE_BACKEND}. "
+                    "Use 'instantid' or 'placeholder'."
+                )
         except QuotaError as exc:
             log(f"GPU QUOTA EXHAUSTED at scene {num}: {str(exc)[:300]}")
             log("Add a Hugging Face token as the HF_TOKEN repo secret, or re-run later. Finished scenes are kept.")
