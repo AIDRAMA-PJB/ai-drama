@@ -1,8 +1,10 @@
 name: render-video
 
-# Triggered by n8n through the GitHub API (workflow_dispatch).
-# Flow: download scene files from a Google Drive folder -> render.sh -> upload final.mp4
-# back into the same folder -> call n8n's callback webhook with the result.
+# Triggered by n8n (workflow_dispatch). n8n only uploads storyboard.json + characters.json to a
+# Drive folder; EVERYTHING heavy happens here:
+#   download job files -> voices + face-locked images (worker/generate_assets.py) -> render.sh (FFmpeg)
+#   -> upload final.mp4 -> call n8n's callback webhook.
+# Re-running with the same folder resumes: finished scene files are downloaded and skipped.
 
 on:
   workflow_dispatch:
@@ -12,8 +14,13 @@ on:
         required: true
         type: string
       folder_id:
-        description: "Google Drive folder ID holding scene_N.png, scene_N.mp3 (and optional bgm.mp3)"
+        description: "Google Drive folder ID that holds storyboard.json and characters.json"
         required: true
+        type: string
+      scenes:
+        description: "Optional scene filter for test runs, e.g. 1-3 or 1,2,5 (empty = all scenes)"
+        required: false
+        default: ""
         type: string
 
 concurrency:
@@ -25,17 +32,19 @@ permissions:
 
 jobs:
   render:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
     env:
       # Inputs go through env vars (never interpolated into shell code) to avoid injection.
       VIDEO_ID: ${{ inputs.video_id }}
       FOLDER_ID: ${{ inputs.folder_id }}
+      SCENES: ${{ inputs.scenes }}
     steps:
       - name: Validate inputs
         run: |
           [[ "$VIDEO_ID" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "Invalid video_id"; exit 1; }
           [[ "$FOLDER_ID" =~ ^[A-Za-z0-9_-]{10,100}$ ]] || { echo "Invalid folder_id"; exit 1; }
+          [[ "$SCENES" =~ ^[0-9,\ -]*$ ]] || { echo "Invalid scenes filter"; exit 1; }
 
       - uses: actions/checkout@v4
 
@@ -45,6 +54,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends ffmpeg jq
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
+      - name: Install Python packages
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet edge-tts gradio_client
+
       - name: Configure rclone (Google Drive)
         env:
           RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
@@ -53,13 +67,27 @@ jobs:
           printf '%s\n' "$RCLONE_CONFIG_CONTENT" > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
 
-      - name: Download scene files from Drive
+      - name: Download job files and earlier progress from Drive
         run: |
           mkdir -p work
           rclone copy gdrive: work --drive-root-folder-id "$FOLDER_ID" \
+            --include "storyboard.json" --include "characters.json" \
             --include "scene_*.png" --include "scene_*.mp3" --include "bgm.mp3" -v
           ls -la work
-          ls work/scene_*.png > /dev/null 2>&1 || { echo "No scene_N.png files found in the Drive folder"; exit 1; }
+          [ -s work/storyboard.json ] && [ -s work/characters.json ] || { echo "storyboard.json / characters.json missing in the Drive folder"; exit 1; }
+
+      - name: Generate voices and face-locked images
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          .venv/bin/python worker/generate_assets.py --workdir work --scenes "$SCENES"
+
+      - name: Save generated scenes to Drive (also when the step above failed)
+        if: always()
+        run: |
+          [ -d work ] || exit 0
+          rclone copy work gdrive: --drive-root-folder-id "$FOLDER_ID" \
+            --include "scene_*.png" --include "scene_*.mp3" -v || true
 
       - name: Render video
         run: |
