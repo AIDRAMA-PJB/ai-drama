@@ -371,75 +371,165 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     work = Path(args.workdir)
-    characters = json.loads((work / "characters.json").read_text(encoding="utf-8"))
-    scenes = json.loads((work / "storyboard.json").read_text(encoding="utf-8"))
+
+    characters = json.loads(
+        (work / "characters.json").read_text(encoding="utf-8")
+    )
+
+    scenes = json.loads(
+        (work / "storyboard.json").read_text(encoding="utf-8")
+    )
+
     scenes = sorted(scenes, key=scene_num)
+
     wanted = parse_scene_filter(args.scenes)
+
     if wanted is not None:
         scenes = [s for s in scenes if scene_num(s) in wanted]
+
     if not scenes:
         log("No scenes selected.")
         return 2
 
-    by_name = {c["character_name"].strip(): c for c in characters}
+    by_name = {
+        c["character_name"].strip(): c
+        for c in characters
+    }
+
     voice_map = build_voice_map(characters)
     rx = build_speaker_regex(voice_map)
 
-    # reference faces for every character that appears in the selected scenes
+    # Reference faces for every character that appears in the selected scenes.
     avatars_dir = work / "avatars"
     avatars_dir.mkdir(exist_ok=True)
-    needed = {pick_primary(s, by_name) for s in scenes}
+
+    needed = {
+        pick_primary(s, by_name)
+        for s in scenes
+    }
+
     avatars = {}
+
     for name in sorted(needed):
-        avatars[name] = fetch_avatar(by_name[name], avatars_dir)
+        avatars[name] = fetch_avatar(
+            by_name[name],
+            avatars_dir
+        )
         log(f"Avatar ready: {name}")
 
     instantid = InstantIDClient()
+
     failed = []
     total = len(scenes)
+
     for idx, scene in enumerate(scenes, 1):
         num = scene_num(scene)
+
         log(f"Scene {num} ({idx}/{total})")
+
         try:
-            log(f"  voice: {make_scene_audio(scene, rx, voice_map, work)}")
+            log(
+                f"  voice: "
+                f"{make_scene_audio(scene, rx, voice_map, work)}"
+            )
         except Exception as exc:  # noqa: BLE001
             log(f"  VOICE FAILED: {exc}")
-            failed.append((num, "voice", str(exc)))
+            failed.append(
+                (num, "voice", str(exc))
+            )
             continue
+
         out_png = work / f"scene_{num}.png"
+
         if non_empty(out_png):
             log("  image: skipped (already exists)")
             continue
-                try:
+
+        try:
             if IMAGE_BACKEND == "placeholder":
-                generate_placeholder_image(scene, out_png)
+                generate_placeholder_image(
+                    scene,
+                    out_png
+                )
 
             elif IMAGE_BACKEND == "instantid":
-                primary = pick_primary(scene, by_name)
-                seed = int(float(by_name[primary].get("avatar_seed") or 42))
-                prompt = re.sub(r"\s+", " ", str(scene["visual_prompt_en"])).strip()
+                primary = pick_primary(
+                    scene,
+                    by_name
+                )
 
-                log(f"  image: face lock = {primary}, seed = {seed}")
-                instantid.generate(avatars[primary], prompt, seed, out_png)
+                seed = int(
+                    float(
+                        by_name[primary].get(
+                            "avatar_seed"
+                        ) or 42
+                    )
+                )
+
+                prompt = re.sub(
+                    r"\s+",
+                    " ",
+                    str(
+                        scene["visual_prompt_en"]
+                    )
+                ).strip()
+
+                log(
+                    f"  image: face lock = "
+                    f"{primary}, seed = {seed}"
+                )
+
+                instantid.generate(
+                    avatars[primary],
+                    prompt,
+                    seed,
+                    out_png
+                )
+
                 log("  image: done")
 
             else:
                 raise RuntimeError(
-                    f"Unknown IMAGE_BACKEND: {IMAGE_BACKEND}. "
+                    f"Unknown IMAGE_BACKEND: "
+                    f"{IMAGE_BACKEND}. "
                     "Use 'instantid' or 'placeholder'."
                 )
+
         except QuotaError as exc:
-            log(f"GPU QUOTA EXHAUSTED at scene {num}: {str(exc)[:300]}")
-            log("Add a Hugging Face token as the HF_TOKEN repo secret, or re-run later. Finished scenes are kept.")
+            log(
+                f"GPU QUOTA EXHAUSTED at scene "
+                f"{num}: {str(exc)[:300]}"
+            )
+
+            log(
+                "Add a Hugging Face token as the "
+                "HF_TOKEN repo secret, or re-run later. "
+                "Finished scenes are kept."
+            )
+
             return 3
+
         except Exception as exc:  # noqa: BLE001
             log(f"  IMAGE FAILED: {exc}")
-            failed.append((num, "image", str(exc)))
+
+            failed.append(
+                (num, "image", str(exc))
+            )
 
     if failed:
-        log("Failed scenes: " + "; ".join(f"{n} ({kind})" for n, kind, _ in failed))
+        log(
+            "Failed scenes: "
+            + "; ".join(
+                f"{n} ({kind})"
+                for n, kind, _ in failed
+            )
+        )
         return 2
-    log(f"All {total} scene(s) generated.")
+
+    log(
+        f"All {total} scene(s) generated."
+    )
+
     return 0
 
 
