@@ -1,0 +1,97 @@
+name: render-video
+
+# Triggered by n8n through the GitHub API (workflow_dispatch).
+# Flow: download scene files from a Google Drive folder -> render.sh -> upload final.mp4
+# back into the same folder -> call n8n's callback webhook with the result.
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: "Video ID (letters, numbers, - and _ only)"
+        required: true
+        type: string
+      folder_id:
+        description: "Google Drive folder ID holding scene_N.png, scene_N.mp3 (and optional bgm.mp3)"
+        required: true
+        type: string
+
+concurrency:
+  group: render-${{ inputs.video_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Inputs go through env vars (never interpolated into shell code) to avoid injection.
+      VIDEO_ID: ${{ inputs.video_id }}
+      FOLDER_ID: ${{ inputs.folder_id }}
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$VIDEO_ID" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "Invalid video_id"; exit 1; }
+          [[ "$FOLDER_ID" =~ ^[A-Za-z0-9_-]{10,100}$ ]] || { echo "Invalid folder_id"; exit 1; }
+
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg, jq and rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg jq
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone (Google Drive)
+        env:
+          RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONFIG_CONTENT" > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+
+      - name: Download scene files from Drive
+        run: |
+          mkdir -p work
+          rclone copy gdrive: work --drive-root-folder-id "$FOLDER_ID" \
+            --include "scene_*.png" --include "scene_*.mp3" --include "bgm.mp3" -v
+          ls -la work
+          ls work/scene_*.png > /dev/null 2>&1 || { echo "No scene_N.png files found in the Drive folder"; exit 1; }
+
+      - name: Render video
+        run: |
+          chmod +x render.sh
+          ./render.sh "$PWD/work"
+          ls -la work/final.mp4
+
+      - name: Upload final.mp4 to Drive
+        id: upload
+        run: |
+          rclone copyto work/final.mp4 gdrive:final.mp4 --drive-root-folder-id "$FOLDER_ID" -v
+          FILE_ID=$(rclone lsjson gdrive: --drive-root-folder-id "$FOLDER_ID" --files-only --include "final.mp4" | jq -r '.[0].ID')
+          echo "file_id=$FILE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Notify n8n
+        if: always()
+        env:
+          CALLBACK_URL: ${{ secrets.N8N_CALLBACK_URL }}
+          CALLBACK_SECRET: ${{ secrets.N8N_CALLBACK_SECRET }}
+          JOB_STATUS: ${{ job.status }}
+          FILE_ID: ${{ steps.upload.outputs.file_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          payload=$(jq -n \
+            --arg video_id "$VIDEO_ID" \
+            --arg folder_id "$FOLDER_ID" \
+            --arg status "$JOB_STATUS" \
+            --arg file_id "$FILE_ID" \
+            --arg run_url "$RUN_URL" \
+            '{video_id:$video_id, folder_id:$folder_id, status:$status, file_id:$file_id, run_url:$run_url}')
+          curl -sS --retry 5 --retry-delay 20 --retry-all-errors --max-time 120 \
+            -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Callback-Secret: $CALLBACK_SECRET" \
+            -d "$payload"
