@@ -22,7 +22,12 @@ on:
         required: false
         default: ""
         type: string
-
+        
+      image_backend:
+        description: "Image backend: instantid or placeholder"
+        required: false
+        default: "instantid"
+        type: string
 concurrency:
   group: render-${{ inputs.video_id }}
   cancel-in-progress: false
