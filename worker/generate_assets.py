@@ -31,6 +31,7 @@ RADIO_DJ_VOICE = "en-US-EricNeural"
 FALLBACK_VOICE = "en-US-GuyNeural"
 PAUSE_SECONDS = 0.3
 NEGATIVE_PROMPT = "blurry, low quality, distorted face, extra limbs, watermark, deformed, text, logo"
+IMAGE_BACKEND = os.environ.get("IMAGE_BACKEND", "instantid").strip().lower()
 QUOTA_HINTS = ("quota", "zerogpu", "exceeded your", "too many requests", "429", "rate limit")
 
 
