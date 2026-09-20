@@ -2,12 +2,13 @@
 # The official n8nio/n8n image no longer ships a package manager (no apk),
 # so we build on Debian-based Node and install n8n from npm instead.
 #
-# If n8n ever complains about the Node version, bump NODE_VERSION.
+# n8n 2.x needs Node 24 and more RAM than the Render free plan (512 MB) has,
+# so we stay on the 1.x line (Node 22): N8N_VERSION=1 means "newest 1.x".
 # After the first good deploy, pin N8N_VERSION (e.g. 1.xx.x) for stable rebuilds.
-ARG NODE_VERSION=24
+ARG NODE_VERSION=22
 FROM node:${NODE_VERSION}-bookworm-slim
 
-ARG N8N_VERSION=latest
+ARG N8N_VERSION=1
 
 USER root
 
