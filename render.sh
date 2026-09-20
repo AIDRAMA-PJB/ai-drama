@@ -1,21 +1,21 @@
 #!/bin/bash
-# render.sh — inaassemble ang scene images + voice audio into isang final drama video.
-# Ginagamit ito ng "Assemble Video (FFmpeg)" Execute Command node sa n8n workflow.
+# render.sh - assembles scene images + voice audio into one final drama video.
+# Used by the GitHub Actions workflow (render.yml) and by the "Assemble Video (FFmpeg)" node in n8n.
 #
-# Usage: ./render.sh /data/output/<video_id>
+# Usage: ./render.sh /path/to/work_folder
 #
-# Inaasahan sa loob ng folder:
-#   scene_1.png, scene_2.png, ...   -> AI-generated images per scene (Pollinations)
+# Expected inside the folder:
+#   scene_1.png, scene_2.png, ...   -> AI-generated image per scene
 #   scene_1.mp3, scene_2.mp3, ...   -> TTS audio per scene (edge-tts)
-#   bgm.mp3                         -> optional background music (kung wala, no-BGM branch)
+#   bgm.mp3                         -> optional background music (if missing, the no-BGM branch runs)
 #
-# Output: final.mp4 sa parehong folder (1080x1920, portrait, para sa Shorts/Reels/TikTok)
+# Output: final.mp4 in the same folder (1080x1920, portrait, for Shorts/Reels/TikTok)
 
 set -e
 DIR="$1"
 
 if [ -z "$DIR" ] || [ ! -d "$DIR" ]; then
-  echo "ERROR: valid folder path required. Usage: ./render.sh /data/output/<video_id>"
+  echo "ERROR: valid folder path required. Usage: ./render.sh /path/to/work_folder"
   exit 1
 fi
 
@@ -23,7 +23,8 @@ cd "$DIR"
 rm -f concat_list.txt
 rm -f clip_*.mp4
 
-# 1) Gumawa ng Ken-Burns (slow zoom) clip per scene, tumatakbo hanggang matapos ang narration nito
+# 1) Build a Ken Burns (slow zoom) clip per scene, lasting as long as its narration.
+#    Scenes are processed in numeric order (scene_2 before scene_10).
 for img in $(ls scene_*.png 2>/dev/null | sort -V); do
   [ -e "$img" ] || continue
   num="${img#scene_}"
@@ -31,7 +32,7 @@ for img in $(ls scene_*.png 2>/dev/null | sort -V); do
   audio="scene_${num}.mp3"
 
   if [ ! -f "$audio" ]; then
-    echo "WARNING: walang audio para sa $img, skinip."
+    echo "WARNING: no audio found for $img, skipping."
     continue
   fi
 
@@ -48,11 +49,11 @@ for img in $(ls scene_*.png 2>/dev/null | sort -V); do
 done
 
 if [ ! -s concat_list.txt ]; then
-  echo "ERROR: walang na-generate na clips. Check kung tama ang scene_N.png / scene_N.mp3 naming."
+  echo "ERROR: no clips were generated. Check that the scene_N.png / scene_N.mp3 naming is correct."
   exit 1
 fi
 
-# 2) I-concat lahat ng scene clips, tapos i-overlay ang background music (kung meron)
+# 2) Concatenate all scene clips, then mix in the background music (if present)
 if [ -f "bgm.mp3" ]; then
   ffmpeg -y -f concat -safe 0 -i concat_list.txt -stream_loop -1 -i bgm.mp3 \
     -filter_complex "[1:a]volume=0.15[bgm];[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]" \
